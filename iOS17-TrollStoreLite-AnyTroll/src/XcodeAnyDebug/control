@@ -1,0 +1,9 @@
+Package: xcode-any-debug
+Name: Xcode Any Debug
+Version: 0.0.3
+Architecture: iphoneos-arm
+Description: debug any process with xcode (jailbroken required)
+Maintainer: roothide
+Author: roothide
+Section: Tweaks
+Depends: ldid, plutil, mobilesubstrate (>= 0.9.5000)

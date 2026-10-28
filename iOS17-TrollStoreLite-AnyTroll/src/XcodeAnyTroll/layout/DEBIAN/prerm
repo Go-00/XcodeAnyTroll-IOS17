@@ -1,0 +1,20 @@
+#!/bin/sh
+
+for candidate in \
+    /Library/LaunchDaemons/com.82flex.trollinstalld.plist \
+    /var/jb/Library/LaunchDaemons/com.82flex.trollinstalld.plist \
+    /var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons/com.82flex.trollinstalld.plist \
+    /rootfs/var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons/com.82flex.trollinstalld.plist
+do
+    for real in $candidate; do
+        if [ -f "$real" ]; then
+            launchctl unload "$real" >/dev/null 2>&1 || true
+            launchctl bootout system "$real" >/dev/null 2>&1 || true
+        fi
+    done
+done
+
+killall -9 trollinstalld 2>/dev/null || true
+killall -9 installd 2>/dev/null || true
+
+exit 0

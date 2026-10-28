@@ -1,0 +1,36 @@
+#!/bin/sh
+
+# 三种越狱布局都要能装：rootful / rootless(/var/jb) / roothide(.jbroot-*)
+find_plist() {
+    for candidate in \
+        /Library/LaunchDaemons/com.82flex.trollinstalld.plist \
+        /var/jb/Library/LaunchDaemons/com.82flex.trollinstalld.plist \
+        /var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons/com.82flex.trollinstalld.plist \
+        /rootfs/var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons/com.82flex.trollinstalld.plist
+    do
+        for real in $candidate; do
+            if [ -f "$real" ]; then
+                echo "$real"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+PLIST=$(find_plist)
+
+if [ -n "$PLIST" ]; then
+    chown root:wheel "$PLIST" 2>/dev/null || true
+    chmod 644 "$PLIST" 2>/dev/null || true
+    launchctl unload "$PLIST" >/dev/null 2>&1 || true
+    launchctl load -w "$PLIST" >/dev/null 2>&1 || \
+        launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
+    echo "xcodeanytroll: loaded daemon from $PLIST"
+else
+    echo "xcodeanytroll: launch daemon plist not found, load it manually" >&2
+fi
+
+killall -9 installd 2>/dev/null || true
+
+exit 0

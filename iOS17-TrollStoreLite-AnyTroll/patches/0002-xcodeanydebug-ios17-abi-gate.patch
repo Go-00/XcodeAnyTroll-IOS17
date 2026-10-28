@@ -1,0 +1,58 @@
+Binary files up-debug/.DS_Store and /Users/sam/Downloads/XcodeAnyDebug-main/.DS_Store differ
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages up-debug/Makefile /Users/sam/Downloads/XcodeAnyDebug-main/Makefile
+--- up-debug/Makefile	2026-10-28 10:17:15
++++ /Users/sam/Downloads/XcodeAnyDebug-main/Makefile	2026-10-28 10:12:01
+@@ -1,4 +1,4 @@
+-export PACKAGE_VERSION := 1.0
++export PACKAGE_VERSION := 1.0.1
+ 
+ ARCHS := arm64 arm64e
+ ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
+Binary files up-debug/layout/.DS_Store and /Users/sam/Downloads/XcodeAnyDebug-main/layout/.DS_Store differ
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages up-debug/main.x /Users/sam/Downloads/XcodeAnyDebug-main/main.x
+--- up-debug/main.x	2026-10-28 10:17:15
++++ /Users/sam/Downloads/XcodeAnyDebug-main/main.x	2026-10-28 10:11:59
+@@ -47,6 +47,15 @@
+ 
+ static void* _dtdsSpawnExecutableWithOptions;
+ 
++/*
++ * 仅适用于 iOS 16 及更早：那时 dtdsSpawnExecutableWithOptions 的第二个参数
++ * 是 ObjC 对象（DTDSSpawnOptions），可以直接 setTargetUserAndGroup:。
++ *
++ * iOS 17 起该参数变成了 C 结构体指针（调用点把参数打包到栈上再传 x1），
++ * DTDSLaunchTargetID / DTDSSpawnOptions 两个类也已经从 DTDeviceServices 里移除。
++ * 继续沿用这段会对着结构体发 objc_msgSend，在 lookUpImpOrForward 里 SIGBUS。
++ * 因此在 17+ 上我们完全不注入这个 hook，让 dtdebugproxyd 保持原生行为。
++ */
+ %hookf(Boolean, _dtdsSpawnExecutableWithOptions, const char *path, DTDSSpawnOptions *options, pid_t *pid, NSError **error)
+ {
+     NSLog(@TAG "_dtdsSpawnExecutableWithOptions path=%s", path);
+@@ -74,11 +83,25 @@
+         }
+     }
+     NSLog(@TAG "isDtds=%@", isDtds ? @"YES" : @"NO");
++
+     if (isDtds) {
++        if (@available(iOS 17, *)) {
++            NSLog(@TAG "iOS 17+ detected: skipping dtds hook (ABI changed to C struct), dtdebugproxyd left untouched");
++            return;
++        }
++
+         _dtdsSpawnExecutableWithOptions = dlsym(RTLD_DEFAULT, "dtdsSpawnExecutableWithOptions");
+-        %init(Dtds);
++        if (_dtdsSpawnExecutableWithOptions) {
++            %init(Dtds);
++        } else {
++            NSLog(@TAG "dtdsSpawnExecutableWithOptions not found, nothing to hook");
++        }
+     } else {
+         _SMJobSubmit = dlsym(RTLD_DEFAULT, "SMJobSubmit");
+-        %init(SMJob);
++        if (_SMJobSubmit) {
++            %init(SMJob);
++        } else {
++            NSLog(@TAG "SMJobSubmit not found, nothing to hook");
++        }
+     }
+ }

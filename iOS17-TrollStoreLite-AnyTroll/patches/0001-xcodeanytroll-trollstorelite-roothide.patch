@@ -1,0 +1,1036 @@
+Binary files up-troll/.DS_Store and /Users/sam/Downloads/XcodeAnyTroll-main/.DS_Store differ
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages --exclude=dist --exclude=.github up-troll/Makefile /Users/sam/Downloads/XcodeAnyTroll-main/Makefile
+--- up-troll/Makefile	2026-10-28 10:17:11
++++ /Users/sam/Downloads/XcodeAnyTroll-main/Makefile	2026-10-28 10:26:50
+@@ -1,4 +1,4 @@
+-export PACKAGE_VERSION := 1.1.3
++export PACKAGE_VERSION := 1.1.4
+ 
+ ARCHS := arm64 arm64e
+ ifeq ($(THEOS_PACKAGE_SCHEME),)
+@@ -13,6 +13,13 @@
+ 
+ include $(THEOS)/makefiles/common.mk
+ 
++# roothide 构建时源码里用到了 jbroot()，实现体在 libroothide 里。
++# theos 只在启用 clang modules 时自动加这个链接参数，这里显式声明更可靠。
++ROOTHIDE_LDFLAGS :=
++ifneq ($(filter roothide,$(THEOS_PACKAGE_SCHEME)),)
++ROOTHIDE_LDFLAGS += -lroothide
++endif
++
+ TWEAK_NAME := XcodeAnyTroll
+ 
+ XcodeAnyTroll_FILES += XcodeAnyTroll.xm
+@@ -22,6 +29,7 @@
+ XcodeAnyTroll_CFLAGS += -FFrameworks
+ 
+ XcodeAnyTroll_LDFLAGS += -FFrameworks
++XcodeAnyTroll_LDFLAGS += $(ROOTHIDE_LDFLAGS)
+ 
+ XcodeAnyTroll_LIBRARIES += iconv
+ XcodeAnyTroll_LIBRARIES += SandyXpc
+@@ -45,6 +53,7 @@
+ trollinstalld_CODESIGN_FLAGS += -Sentitlements.plist
+ 
+ trollinstalld_LIBRARIES += SandyXpc
++trollinstalld_LDFLAGS += $(ROOTHIDE_LDFLAGS)
+ 
+ trollinstalld_FRAMEWORKS += Foundation
+ 
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages --exclude=dist --exclude=.github up-troll/XcodeAnyTroll.xm /Users/sam/Downloads/XcodeAnyTroll-main/XcodeAnyTroll.xm
+--- up-troll/XcodeAnyTroll.xm	2026-10-28 10:17:11
++++ /Users/sam/Downloads/XcodeAnyTroll-main/XcodeAnyTroll.xm	2026-10-28 10:26:50
+@@ -12,10 +12,25 @@
+ 
+ #define TAG "[XcodeAnyTroll] "
+ 
++/*
++ * roothide 下越狱侧文件全在随机命名的 jbroot 里，静态路径必须过 jbroot()。
++ * 用 roothide/theos 构建时该头与函数可用；普通 theos 下退化成恒等映射。
++ */
++#if __has_include(<roothide.h>)
++#import <roothide.h>
++#define XAT_HAS_ROOTHIDE 1
++#else
++#define XAT_HAS_ROOTHIDE 0
++static inline const char *jbroot(const char *path) { return path; }
++#endif
++
+ static NSString *gPackageIdentifier = nil;
+ static NSString *gPackagePath = nil;
+ static LSRecordPromise *gRecordPromise = nil;
+ 
++/* 防递归：万一哪天走了 helper 的 installd 分支，会把安装打回我们自己的 hook */
++static BOOL gInstallingViaTrollStore = NO;
++
+ static SandyXpcMessagingCenter *GetXpcMessagingCenter(void) {
+     static SandyXpcMessagingCenter *messagingCenter = nil;
+     static dispatch_once_t onceToken;
+@@ -25,6 +40,108 @@
+     return messagingCenter;
+ }
+ 
++/*
++ * installd 的 Xcode 安装流程里，待安装的 .app 位于 /var/installd/.../staging 下，
++ * 但它落在哪个子目录、错误描述里是否带上路径，各系统版本并不一致。
++ * 依次尝试：url.path → 错误文本里的路径 → staging 目录扫描。
++ */
++static NSString *ResolveStagedAppPath(NSURL *url, NSString *errorDescription) {
++    NSFileManager *fileManager = [NSFileManager defaultManager];
++    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
++
++    if (url.isFileURL && url.path.length > 0) {
++        [candidates addObject:url.path];
++    }
++
++    if (errorDescription.length > 0) {
++        NSRegularExpression *regex =
++            [NSRegularExpression regularExpressionWithPattern:@"(/private)?/var/installd/[^:\\s\"']+"
++                                                     options:0
++                                                       error:nil];
++        NSArray<NSTextCheckingResult *> *matches =
++            [regex matchesInString:errorDescription options:0 range:NSMakeRange(0, errorDescription.length)];
++        for (NSTextCheckingResult *match in matches) {
++            NSString *path = [[errorDescription substringWithRange:match.range]
++                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
++            if (path.length > 0) [candidates addObject:path];
++        }
++    }
++
++    for (NSString *candidate in candidates) {
++        NSString *infoPlistPath = [candidate stringByAppendingPathComponent:@"Info.plist"];
++        if ([fileManager fileExistsAtPath:infoPlistPath]) return candidate;
++    }
++
++    /* 最后兜底：扫 staging 根目录下两层找 .app */
++    NSArray<NSString *> *stagingRoots = @[
++        @"/private/var/installd/Library/Caches/com.apple.mobile.installd.staging",
++        @"/var/installd/Library/Caches/com.apple.mobile.installd.staging",
++    ];
++    for (NSString *root in stagingRoots) {
++        for (NSString *first in [fileManager contentsOfDirectoryAtPath:root error:nil]) {
++            NSString *firstPath = [root stringByAppendingPathComponent:first];
++            for (NSString *second in [fileManager contentsOfDirectoryAtPath:firstPath error:nil]) {
++                NSString *secondPath = [firstPath stringByAppendingPathComponent:second];
++                if ([[secondPath pathExtension] isEqualToString:@"app"] &&
++                    [fileManager fileExistsAtPath:[secondPath stringByAppendingPathComponent:@"Info.plist"]]) {
++                    return secondPath;
++                }
++            }
++        }
++    }
++
++    return nil;
++}
++
++/*
++ * daemon 刚被 launchd 拉起时 mach service 可能还没就绪，首次连接会失败，
++ * 所以重试一次再放弃。返回值保留原始 error 供上层拼进 Xcode 的报错。
++ */
++static NSDictionary *InstallPackageViaTrollStore(NSString *packagePath, NSString *packageIdentifier,
++                                                 NSError **errorPtr) {
++    if (gInstallingViaTrollStore) {
++        HBLogError(@TAG "recursive install attempt blocked");
++        if (errorPtr) {
++            *errorPtr = [NSError errorWithDomain:@"XcodeAnyTroll"
++                                            code:-1
++                                        userInfo:@{NSLocalizedDescriptionKey : @"Recursive install blocked"}];
++        }
++        return nil;
++    }
++
++    gInstallingViaTrollStore = YES;
++
++    NSDictionary *retVal = nil;
++    NSError *lastError = nil;
++
++    for (int attempt = 0; attempt < 2; attempt++) {
++        NSError *xpcError = nil;
++        retVal = [GetXpcMessagingCenter() sendMessageAndReceiveReplyName:@"InstallPackage"
++                                                                userInfo:@{
++                                                                    @"PackagePath" : packagePath,
++                                                                    @"PackageIdentifier" : packageIdentifier,
++                                                                }
++                                                                   error:&xpcError];
++        lastError = xpcError;
++        if (retVal && !xpcError) break;
++        HBLogDebug(@TAG "XPC attempt %d failed: %@", attempt + 1, xpcError);
++        usleep(200 * 1000);
++    }
++
++    gInstallingViaTrollStore = NO;
++
++    if (errorPtr) *errorPtr = lastError;
++    return retVal;
++}
++
++/* 安装结束后清掉全局状态，避免下一次安装串味 */
++static void ResetPackageState(void) {
++    gPackageIdentifier = nil;
++    gPackagePath = nil;
++    gRecordPromise = nil;
++}
++
++
+ #import <Foundation/Foundation.h>
+ 
+ struct BlockDescriptor {
+@@ -82,43 +199,38 @@
+             return result;
+         }
+ 
+-        // Extract source directory from error description instead of using url.path
+-        NSString *errorDesc = [error description];
+-        NSString *sourceDirectory = nil;
+-        
+-        // Find path that starts with /var/installd/ and ends with colon
+-        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"/var/installd/[^:]+" options:0 error:nil];
+-        NSTextCheckingResult *match = [regex firstMatchInString:errorDesc options:0 range:NSMakeRange(0, errorDesc.length)];
+-        
+-        if (!match) {
+-            HBLogDebug(@TAG "Failed to extract source directory from error: %@", errorDesc);
++        // 待安装的 .app 在 staging 下的确切位置各版本不一致，走三级兜底解析
++        NSString *errorDescription = [error description];
++        HBLogInfo(@TAG "signature error captured: %@", errorDescription);
++
++        NSString *sourceDirectory = ResolveStagedAppPath(url, errorDescription);
++        if (sourceDirectory.length == 0) {
++            HBLogError(@TAG "unable to resolve staged app path, url=%@", url);
+             return result;
+         }
++        HBLogInfo(@TAG "staged app resolved: %@", sourceDirectory);
+ 
+-        sourceDirectory = [[errorDesc substringWithRange:match.range] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+-        HBLogDebug(@TAG "Extracted source directory: %@", sourceDirectory);
+-
+         // Ensure sourceDirectory is valid
+         NSString *infoPlistPath = [sourceDirectory stringByAppendingPathComponent:@"Info.plist"];
+         if (![[NSFileManager defaultManager] fileExistsAtPath:infoPlistPath]) {
+-            HBLogDebug(@TAG "Info.plist not found at path: %@", infoPlistPath);
++            HBLogError(@TAG "Info.plist not found at path: %@", infoPlistPath);
+             return result;
+         }
+ 
+         // Read Info.plist to get package identifier
+         NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+         if (!infoPlist) {
+-            HBLogDebug(@TAG "Failed to read Info.plist at path: %@", infoPlistPath);
++            HBLogError(@TAG "Failed to read Info.plist at path: %@", infoPlistPath);
+             return result;
+         }
+ 
+         gPackageIdentifier = infoPlist[@"CFBundleIdentifier"];
+         if (!gPackageIdentifier) {
+-            HBLogDebug(@TAG "CFBundleIdentifier not found in Info.plist");
++            HBLogError(@TAG "CFBundleIdentifier not found in Info.plist");
+             return result;
+         }
+ 
+-        HBLogDebug(@TAG "Package identifier extracted: %@", gPackageIdentifier);
++        HBLogInfo(@TAG "package identifier: %@", gPackageIdentifier);
+         
+         NSString *tempDir = NSTemporaryDirectory();
+         NSString *workDir = [tempDir stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+@@ -141,18 +253,18 @@
+         BOOL copySuccess = [fileManager copyItemAtPath:sourceDirectory toPath:destAppPath error:&copyError];
+         
+         if (!copySuccess) {
+-            HBLogDebug(@TAG "Failed to copy app to Payload directory: %@", copyError);
++            HBLogError(@TAG "failed to copy app into Payload: %@", copyError);
+         } else {
+-            HBLogDebug(@TAG "Successfully copied app to Payload directory");
+-            
++            HBLogInfo(@TAG "app copied into Payload: %@", destAppPath);
++
+             // Create zip file (IPA)
+             HBLogDebug(@TAG "Creating IPA file from Payload directory");
+             BOOL success = [SSZipArchive createZipFileAtPath:ipaFilePath withContentsOfDirectory:workDir keepParentDirectory:NO compressionLevel:0 password:nil AES:NO progressHandler:nil];
+             
+             if (success) {
+-                HBLogDebug(@TAG "Successfully created IPA file: %@", ipaFilePath);
++                HBLogInfo(@TAG "ipa created: %@", ipaFilePath);
+             } else {
+-                HBLogDebug(@TAG "Failed to create IPA file");
++                HBLogError(@TAG "failed to create ipa from %@", workDir);
+             }
+             
+             // Clean up temporary directory
+@@ -199,27 +311,23 @@
+         }
+ 
+         if (gPackagePath && gPackageIdentifier && ([[error description] containsString:@"0xe800801c"] || [[error description] containsString:@"0xe8008001"])) {
+-            NSError *error = nil;
+-            NSDictionary *retVal = nil;
+-
+-            retVal = [GetXpcMessagingCenter() sendMessageAndReceiveReplyName:@"InstallPackage" userInfo:@{
+-                @"PackagePath": gPackagePath,
+-                @"PackageIdentifier": gPackageIdentifier,
+-            } error:&error];
+-            if (error) {
+-                HBLogDebug(@TAG "XPC error occurred: %@", error);
+-                completion(succeed, appList, recordPromise, error);
++            NSError *installError = nil;
++            NSDictionary *retVal = InstallPackageViaTrollStore(gPackagePath, gPackageIdentifier, &installError);
++            if (!retVal || installError) {
++                HBLogError(@TAG "install via trollstore failed: %@ / %@", installError, retVal[@"OutputTail"]);
++                completion(succeed, appList, recordPromise, installError);
++                ResetPackageState();
+                 return;
+             }
+ 
+-            HBLogDebug(@TAG "XPC reply received: %@", retVal);
++            HBLogInfo(@TAG "trollstore install succeeded: %@", retVal);
+ 
+             LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:gPackageIdentifier];
+-            LSRecordPromise *recordPromise = [[%c(LSRecordPromise) alloc] initWithRecord:appProxy.correspondingApplicationRecord error:nil];
++            LSRecordPromise *promise = [[%c(LSRecordPromise) alloc] initWithRecord:appProxy.correspondingApplicationRecord error:nil];
+ 
+-            /* LSRecordPromise is not properly constructed in some cases, still need some work here. */
+-
+-            completion(YES, retVal[@"InstalledAppInfoArray"], gRecordPromise ?: recordPromise, nil);
++            /* LSRecordPromise 在部分系统版本上构造不完整，优先用 installd 自己产出的那个 */
++            completion(YES, retVal[@"InstalledAppInfoArray"], gRecordPromise ?: promise, nil);
++            ResetPackageState();
+             return;
+         }
+ 
+@@ -246,27 +354,23 @@
+         }
+ 
+         if (gPackagePath && gPackageIdentifier && ([[error description] containsString:@"0xe800801c"] || [[error description] containsString:@"0xe8008001"])) {
+-            NSError *error = nil;
+-            NSDictionary *retVal = nil;
+-
+-            retVal = [GetXpcMessagingCenter() sendMessageAndReceiveReplyName:@"InstallPackage" userInfo:@{
+-                @"PackagePath": gPackagePath,
+-                @"PackageIdentifier": gPackageIdentifier,
+-            } error:&error];
+-            if (error) {
+-                HBLogDebug(@TAG "XPC error occurred: %@", error);
+-                completion(succeed, appList, recordPromise, error);
++            NSError *installError = nil;
++            NSDictionary *retVal = InstallPackageViaTrollStore(gPackagePath, gPackageIdentifier, &installError);
++            if (!retVal || installError) {
++                HBLogError(@TAG "install via trollstore failed: %@ / %@", installError, retVal[@"OutputTail"]);
++                completion(succeed, appList, recordPromise, installError);
++                ResetPackageState();
+                 return;
+             }
+ 
+-            HBLogDebug(@TAG "XPC reply received: %@", retVal);
++            HBLogInfo(@TAG "trollstore install succeeded: %@", retVal);
+ 
+             LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:gPackageIdentifier];
+-            LSRecordPromise *recordPromise = [[%c(LSRecordPromise) alloc] initWithRecord:appProxy.correspondingApplicationRecord error:nil];
++            LSRecordPromise *promise = [[%c(LSRecordPromise) alloc] initWithRecord:appProxy.correspondingApplicationRecord error:nil];
+ 
+-            /* LSRecordPromise is not properly constructed in some cases, still need some work here. */
+-
+-            completion(YES, retVal[@"InstalledAppInfoArray"], gRecordPromise ?: recordPromise, nil);
++            /* LSRecordPromise 在部分系统版本上构造不完整，优先用 installd 自己产出的那个 */
++            completion(YES, retVal[@"InstalledAppInfoArray"], gRecordPromise ?: promise, nil);
++            ResetPackageState();
+             return;
+         }
+ 
+@@ -293,22 +397,18 @@
+         }
+ 
+         if (gPackagePath && gPackageIdentifier && ([[error description] containsString:@"0xe800801c"] || [[error description] containsString:@"0xe8008001"])) {
+-            NSError *error = nil;
+-            NSDictionary *retVal = nil;
+-
+-            retVal = [GetXpcMessagingCenter() sendMessageAndReceiveReplyName:@"InstallPackage" userInfo:@{
+-                @"PackagePath": gPackagePath,
+-                @"PackageIdentifier": gPackageIdentifier,
+-            } error:&error];
+-            if (error) {
+-                HBLogDebug(@TAG "XPC error occurred: %@", error);
+-                completion(userInfo, error);
++            NSError *installError = nil;
++            NSDictionary *retVal = InstallPackageViaTrollStore(gPackagePath, gPackageIdentifier, &installError);
++            if (!retVal || installError) {
++                HBLogError(@TAG "install via trollstore failed: %@ / %@", installError, retVal[@"OutputTail"]);
++                completion(userInfo, installError);
++                ResetPackageState();
+                 return;
+             }
+ 
+-            HBLogDebug(@TAG "XPC reply received: %@", retVal);
+-            
++            HBLogInfo(@TAG "trollstore install succeeded: %@", retVal);
+             completion(retVal, nil);
++            ResetPackageState();
+             return;
+         }
+ 
+@@ -350,12 +450,13 @@
+ 
+ %ctor {
+     @autoreleasepool {
+-        void *sandyHandle = dlopen("@rpath/libsandy.dylib", RTLD_LAZY);
++        /* roothide 下 libSandy 在 jbroot 里，用 jbroot() 解析，不再靠 @loader_path 猜 */
++        const char *sandyPath = jbroot("/usr/lib/libsandy.dylib");
++        HBLogInfo(@TAG "loading libSandy from %s", sandyPath);
++
++        void *sandyHandle = dlopen(sandyPath, RTLD_LAZY);
+         if (!sandyHandle) {
+             sandyHandle = dlopen("/usr/lib/libsandy.dylib", RTLD_LAZY);
+-        }
+-        if (!sandyHandle) {
+-            sandyHandle = dlopen("@loader_path/.jbroot/usr/lib/libsandy.dylib", RTLD_LAZY);
+         }
+         if (sandyHandle) {
+             int (*__dyn_libSandy_applyProfile)(const char *profileName) =
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages --exclude=dist --exclude=.github up-troll/build.sh /Users/sam/Downloads/XcodeAnyTroll-main/build.sh
+--- up-troll/build.sh	2026-10-28 10:17:11
++++ /Users/sam/Downloads/XcodeAnyTroll-main/build.sh	2026-10-28 09:50:14
+@@ -2,6 +2,33 @@
+ 
+ set -e
+ 
+-FINALPACKAGE=1 THEOS_PACKAGE_SCHEME='' gmake clean package
+-FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless gmake clean package
+-FINALPACKAGE=1 THEOS="$HOME/theos-roothide" THEOS_PACKAGE_SCHEME=roothide gmake clean package
++# 三个 scheme 全部用 roothide/theos 构建：
++# 它的 SDK 提供 roothide.h / jbroot()，并对 rootful、rootless 输出保持兼容。
++# 用普通 theos 构建时源码里的 jbroot() 会退化成恒等映射，无法定位 jbroot 内文件。
++THEOS_DIR="${THEOS_DIR:-$HOME/theos-roothide}"
++
++if [ ! -d "$THEOS_DIR" ]; then
++  echo "缺少 roothide theos: $THEOS_DIR" >&2
++  echo "安装: git clone --recursive https://github.com/roothide/theos.git ~/theos-roothide" >&2
++  exit 1
++fi
++
++# macOS 上没有 gmake，退回到 make
++MAKE_BIN="${MAKE_BIN:-$(command -v gmake || command -v make)}"
++
++# 只出需要的 scheme：SCHEMES="roothide" ./build.sh
++SCHEMES="${SCHEMES:-rootful rootless roothide}"
++
++for scheme in $SCHEMES; do
++  if [ "$scheme" = "rootful" ]; then
++    SCHEME_ARG=""
++  else
++    SCHEME_ARG="$scheme"
++  fi
++  echo "==> building scheme: ${SCHEME_ARG:-rootful}"
++  FINALPACKAGE=1 THEOS="$THEOS_DIR" THEOS_PACKAGE_SCHEME="$SCHEME_ARG" "$MAKE_BIN" clean package
++done
++
++echo
++echo "==> 产物:"
++ls -1 "$(cd "$(dirname "$0")" && pwd)"/packages/*.deb 2>/dev/null || echo "  (无)"
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages --exclude=dist --exclude=.github up-troll/devkit/diag-device.sh /Users/sam/Downloads/XcodeAnyTroll-main/devkit/diag-device.sh
+--- up-troll/devkit/diag-device.sh	1970-01-01 08:00:00
++++ /Users/sam/Downloads/XcodeAnyTroll-main/devkit/diag-device.sh	2026-10-28 09:28:47
+@@ -0,0 +1,59 @@
++#!/bin/sh
++# XcodeAnyTroll 诊断脚本 — 在越狱设备上以 root 运行，输出一份环境快照
++# 用法: ssh root@DEVICE 'sh -s' < devkit/diag-device.sh > diag.txt
++#      或 NewTerm3: sh /var/.../diag-device.sh
++
++line() { echo; echo "===== $* ====="; }
++
++line "0. 身份"
++id
++uname -a
++echo "OS: $(sw_vers -productVersion 2>/dev/null) ($(sw_vers -buildVersion 2>/dev/null))"
++echo "MODEL: $(sysctl -n hw.model 2>/dev/null)  CPU: $(sysctl -n hw.ncpu 2>/dev/null)"
++
++line "1. 越狱形态 / jbroot"
++ls -d /var/jb 2>/dev/null && echo "ROOTLESS(/var/jb) = yes"
++for d in /var/containers/Bundle/Application/.jbroot-*; do
++    [ -d "$d" ] && echo "ROOTHIDE jbroot = $d"
++done
++ls -d /var/lib/dpkg 2>/dev/null
++echo "launchctl(getuid=$(id -u)):"
++launchctl list 2>/dev/null | grep -iE "jailbreakd|dopamine|roothide|ellekit|troll|82flex|sandy" || echo "  (launchctl list 需要 root)"
++
++line "2. 越狱 / 依赖包版本"
++DPKG_DB=/var/lib/dpkg/status
++[ -f /var/jb/var/lib/dpkg/status ] && DPKG_DB=/var/jb/var/lib/dpkg/status
++for j in /var/containers/Bundle/Application/.jbroot-*/var/lib/dpkg/status; do [ -f "$j" ] && DPKG_DB="$j"; done
++echo "status db: $DPKG_DB"
++awk '/^Package:/{p=$2} /^Version:/{print p" "$2}' "$DPKG_DB" 2>/dev/null | grep -iE "dopamine|roothide|bootstrap|ellekit|substrate|troll|ldid|sandy|apps?sync|xcode" 
++
++line "3. TrollStore / TrollStoreLite"
++for p in /Applications /var/jb/Applications /var/containers/Bundle/Application/*/ /var/containers/Bundle/Application/.jbroot-*/Applications; do
++    for a in "$p"/*Troll*.app; do [ -d "$a" ] && echo "APP: $a"; done 2>/dev/null
++done
++echo "--- 找 helper 二进制"
++find / -maxdepth 7 \( -name 'trollstorehelper' -o -name 'trollstorehelper_lite' \) -type f 2>/dev/null
++echo "--- /usr/local/bin"
++ls -l /var/jb/usr/local/bin /usr/local/bin 2>/dev/null
++for d in /var/containers/Bundle/Application/.jbroot-*/usr/local/bin; do ls -l "$d" 2>/dev/null; done
++echo "--- ldid"
++for l in /var/jb/usr/bin/ldid /usr/bin/ldid; do [ -x "$l" ] && { echo "$l:"; "$l" -v 2>&1 | head -4; }; done
++
++line "4. libSandy"
++find / -maxdepth 6 -name 'libsandy*' 2>/dev/null | head -20
++echo "--- profiles"
++for d in /Library/libSandy /var/jb/Library/libSandy /var/containers/Bundle/Application/.jbroot-*/Library/libSandy; do ls -l "$d" 2>/dev/null; done
++
++line "5. 本项目已安装情况"
++for d in /Library/LaunchDaemons /var/jb/Library/LaunchDaemons /var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons; do ls -l "$d"/com.82flex.* 2>/dev/null; done
++find / -maxdepth 7 -name 'XcodeAnyTroll.dylib' 2>/dev/null
++find / -maxdepth 7 -name 'trollinstalld' 2>/dev/null
++echo "--- 进程"
++ps ax 2>/dev/null | grep -iE "trollinstalld|installd" | grep -v grep
++
++line "6. 最近的安装 / 签名错误 (syslog 尾)"
++( log show --last 10m --predicate 'process == "installd" OR process == "appinstalld"' 2>/dev/null \
++  || cat /var/log/syslog 2>/dev/null ) | grep -iE "XcodeAnyTroll|0xe8008|signature|TrollInstaller|installURL" | tail -40
++
++line "7. 结束"
++echo "把上面全部内容贴回来即可"
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages --exclude=dist --exclude=.github up-troll/devkit/syntax-check.sh /Users/sam/Downloads/XcodeAnyTroll-main/devkit/syntax-check.sh
+--- up-troll/devkit/syntax-check.sh	1970-01-01 08:00:00
++++ /Users/sam/Downloads/XcodeAnyTroll-main/devkit/syntax-check.sh	2026-10-28 09:46:04
+@@ -0,0 +1,56 @@
++#!/bin/bash
++# 在 macOS 上不做真机链接、只做语法检查：
++#   - logos.pl 预处理 .xm（校验 %hook / %orig / %c 用法）
++#   - clang -fsyntax-only 过一遍 tweak 与 daemon
++# 桩头文件用于替代 iOS SDK 里缺失的部分（UIKit / CydiaSubstrate / roothide.h / SandyXpc）。
++# 真正的编译、链接、签名仍然是 `./build.sh`（需要 roothide theos + iPhoneOS SDK）。
++
++set -e
++
++ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++STUBS="$(mktemp -d)"
++trap 'rm -rf "$STUBS"' EXIT
++
++SDK="$(xcrun --show-sdk-path)"
++THEOS_INC="${THEOS_INC:-/opt/theos/vendor/include}"
++
++mkdir -p "$STUBS/UIKit" "$STUBS/CydiaSubstrate" "$STUBS/SSZipArchive"
++printf '#import <Foundation/Foundation.h>\n' > "$STUBS/UIKit/UIKit.h"
++printf '#ifndef ROOTHIDE_STUB_H\n#define ROOTHIDE_STUB_H\n#ifdef __cplusplus\nextern "C" {\n#endif\nconst char *jbroot(const char *path);\n#ifdef __cplusplus\n}\n#endif\n#endif\n' > "$STUBS/roothide.h"
++printf '#ifndef STUB_SUBSTRATE_H\n#define STUB_SUBSTRATE_H\n#import <objc/runtime.h>\nstatic inline void MSHookMessageEx(Class c, SEL s, IMP i, IMP *r) {}\n#endif\n' > "$STUBS/CydiaSubstrate/CydiaSubstrate.h"
++cp "$ROOT"/Frameworks/SSZipArchive.framework/Headers/SSZipArchive.h \
++   "$ROOT"/Frameworks/SSZipArchive.framework/Headers/SSZipCommon.h "$STUBS/SSZipArchive/"
++
++# SandyXpc 的头文件由它的包提供，这里临时取一份
++SANDYXPC="$(mktemp -d)"
++trap 'rm -rf "$STUBS" "$SANDYXPC"' EXIT
++git clone --depth 1 -q https://github.com/Lessica/SandyXpc.git "$SANDYXPC"
++cp "$SANDYXPC"/libSandyXpc.h "$SANDYXPC"/SandyXpc*.h "$STUBS/"
++
++CFLAGS=(-fsyntax-only -fobjc-arc -x objective-c++ -isysroot "$SDK"
++        -I"$STUBS" -I"$ROOT/Headers" -I"$ROOT/Frameworks" -I"$THEOS_INC")
++
++check() {
++  local label="$1" source="$2"
++  printf '==> %s\n' "$label"
++  if clang++ "${CFLAGS[@]}" -DTHEOS_INSTANCE_NAME='"XcodeAnyTroll"' -DDEBUG=0 "$source"; then
++    printf '    OK\n'
++  else
++    printf '    FAILED\n' >&2
++    exit 1
++  fi
++}
++
++LOGOS_OUT="$STUBS/XcodeAnyTroll.mm"
++perl /opt/theos/bin/logos.pl "$ROOT/XcodeAnyTroll.xm" > "$LOGOS_OUT"
++
++check "tweak (roothide 分支)"      "$LOGOS_OUT"
++check "daemon (roothide 分支)"     "$ROOT/trollinstalld.mm"
++
++# 去掉 roothide.h 再验一次 rootful/rootless 分支
++rm -f "$STUBS/roothide.h"
++perl /opt/theos/bin/logos.pl "$ROOT/XcodeAnyTroll.xm" > "$LOGOS_OUT"
++check "tweak (rootful/rootless 分支)"  "$LOGOS_OUT"
++check "daemon (rootful/rootless 分支)" "$ROOT/trollinstalld.mm"
++
++echo "全部通过。"
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages --exclude=dist --exclude=.github up-troll/entitlements.plist /Users/sam/Downloads/XcodeAnyTroll-main/entitlements.plist
+--- up-troll/entitlements.plist	2026-10-28 10:17:11
++++ /Users/sam/Downloads/XcodeAnyTroll-main/entitlements.plist	2026-10-28 09:45:10
+@@ -5,5 +5,11 @@
+     <true/>
+     <key>com.apple.private.security.container-required</key>
+     <false/>
++    <key>com.apple.private.security.no-sandbox</key>
++    <true/>
++    <key>com.apple.private.security.storage.AppBundles</key>
++    <true/>
++    <key>com.apple.private.security.storage.AppDataContainers</key>
++    <true/>
+ </dict>
+ </plist>
+Binary files up-troll/layout/.DS_Store and /Users/sam/Downloads/XcodeAnyTroll-main/layout/.DS_Store differ
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages --exclude=dist --exclude=.github up-troll/layout/DEBIAN/postinst /Users/sam/Downloads/XcodeAnyTroll-main/layout/DEBIAN/postinst
+--- up-troll/layout/DEBIAN/postinst	2026-10-28 10:17:11
++++ /Users/sam/Downloads/XcodeAnyTroll-main/layout/DEBIAN/postinst	2026-10-28 09:51:56
+@@ -1,16 +1,36 @@
+ #!/bin/sh
+ 
+-if [ -f /Library/LaunchDaemons/com.82flex.trollinstalld.plist ]; then
+-    launchctl load -w /Library/LaunchDaemons/com.82flex.trollinstalld.plist || true
+-elif [ -f /var/jb/Library/LaunchDaemons/com.82flex.trollinstalld.plist ]; then
+-    launchctl load -w /var/jb/Library/LaunchDaemons/com.82flex.trollinstalld.plist || true
++# 三种越狱布局都要能装：rootful / rootless(/var/jb) / roothide(.jbroot-*)
++find_plist() {
++    for candidate in \
++        /Library/LaunchDaemons/com.82flex.trollinstalld.plist \
++        /var/jb/Library/LaunchDaemons/com.82flex.trollinstalld.plist \
++        /var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons/com.82flex.trollinstalld.plist \
++        /rootfs/var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons/com.82flex.trollinstalld.plist
++    do
++        for real in $candidate; do
++            if [ -f "$real" ]; then
++                echo "$real"
++                return 0
++            fi
++        done
++    done
++    return 1
++}
++
++PLIST=$(find_plist)
++
++if [ -n "$PLIST" ]; then
++    chown root:wheel "$PLIST" 2>/dev/null || true
++    chmod 644 "$PLIST" 2>/dev/null || true
++    launchctl unload "$PLIST" >/dev/null 2>&1 || true
++    launchctl load -w "$PLIST" >/dev/null 2>&1 || \
++        launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
++    echo "xcodeanytroll: loaded daemon from $PLIST"
+ else
+-    ROOTHIDE_PATH=$(ls -d /var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons/com.82flex.trollinstalld.plist)
+-    if [ -f "$ROOTHIDE_PATH" ]; then
+-        launchctl load -w "$ROOTHIDE_PATH" || true
+-    fi
++    echo "xcodeanytroll: launch daemon plist not found, load it manually" >&2
+ fi
+ 
+-killall -9 installd || true
++killall -9 installd 2>/dev/null || true
+ 
+ exit 0
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages --exclude=dist --exclude=.github up-troll/layout/DEBIAN/prerm /Users/sam/Downloads/XcodeAnyTroll-main/layout/DEBIAN/prerm
+--- up-troll/layout/DEBIAN/prerm	2026-10-28 10:17:11
++++ /Users/sam/Downloads/XcodeAnyTroll-main/layout/DEBIAN/prerm	2026-10-28 09:51:56
+@@ -1,16 +1,20 @@
+ #!/bin/sh
+ 
+-if [ -f /Library/LaunchDaemons/com.82flex.trollinstalld.plist ]; then
+-    launchctl unload /Library/LaunchDaemons/com.82flex.trollinstalld.plist || true
+-elif [ -f /var/jb/Library/LaunchDaemons/com.82flex.trollinstalld.plist ]; then
+-    launchctl unload /var/jb/Library/LaunchDaemons/com.82flex.trollinstalld.plist || true
+-else
+-    ROOTHIDE_PATH=$(ls -d /var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons/com.82flex.trollinstalld.plist)
+-    if [ -f "$ROOTHIDE_PATH" ]; then
+-        launchctl unload "$ROOTHIDE_PATH" || true
+-    fi
+-fi
++for candidate in \
++    /Library/LaunchDaemons/com.82flex.trollinstalld.plist \
++    /var/jb/Library/LaunchDaemons/com.82flex.trollinstalld.plist \
++    /var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons/com.82flex.trollinstalld.plist \
++    /rootfs/var/containers/Bundle/Application/.jbroot-*/Library/LaunchDaemons/com.82flex.trollinstalld.plist
++do
++    for real in $candidate; do
++        if [ -f "$real" ]; then
++            launchctl unload "$real" >/dev/null 2>&1 || true
++            launchctl bootout system "$real" >/dev/null 2>&1 || true
++        fi
++    done
++done
+ 
+-killall -9 installd || true
++killall -9 trollinstalld 2>/dev/null || true
++killall -9 installd 2>/dev/null || true
+ 
+ exit 0
+Binary files up-troll/layout/Library/.DS_Store and /Users/sam/Downloads/XcodeAnyTroll-main/layout/Library/.DS_Store differ
+diff -ruN --exclude=.git --exclude=.theos --exclude=packages --exclude=dist --exclude=.github up-troll/trollinstalld.mm /Users/sam/Downloads/XcodeAnyTroll-main/trollinstalld.mm
+--- up-troll/trollinstalld.mm	2026-10-28 10:17:11
++++ /Users/sam/Downloads/XcodeAnyTroll-main/trollinstalld.mm	2026-10-28 09:45:52
+@@ -1,7 +1,10 @@
+ #import <Foundation/Foundation.h>
+ #import <HBLog.h>
+ #import <errno.h>
++#import <fcntl.h>
+ #import <spawn.h>
++#import <stdlib.h>
++#import <string.h>
+ #import <sys/wait.h>
+ 
+ #import <libSandyXpc.h>
+@@ -9,54 +12,206 @@
+ #import "LSApplicationProxy.h"
+ #import "MCMContainer.h"
+ 
++/*
++ * roothide 下所有越狱文件都活在一个随机命名的 jbroot 里，
++ * 静态路径必须经过 jbroot() 解析：/Applications/TrollStoreLite.app/... 这种
++ * 字面量在 roothide 进程里指向的是 rootfs，永远找不到。
++ * 用 roothide/theos 构建时该头与函数可用；普通 theos 下退化成恒等映射。
++ */
++#if __has_include(<roothide.h>)
++#import <roothide.h>
++#define XAT_HAS_ROOTHIDE 1
++#else
++#define XAT_HAS_ROOTHIDE 0
++#endif
++
+ #define TAG "TrollInstallerService : "
+ 
+-__used static const char *installer_binary(void) {
+-    static NSString *_binary = NULL;
+-    static dispatch_once_t onceToken;
+-    dispatch_once(&onceToken, ^{
+-      NSString *bundlePath = nil;
+-      if (!bundlePath) {
+-          LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:@"com.opa334.TrollStore"];
+-          bundlePath = [appProxy.bundleURL path];
+-      }
+-      if (!bundlePath) {
+-          LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:@"com.opa334.TrollStoreLite"];
+-          bundlePath = [appProxy.bundleURL path];
+-      }
+-      if (!bundlePath) {
+-          NSString *bundleContainerPath = [[[MCMAppContainer containerWithIdentifier:@"com.opa334.TrollStore"
+-                                                                               error:nil] url] path];
+-          NSArray<NSString *> *bundleItems =
+-              [[NSFileManager defaultManager] contentsOfDirectoryAtPath:bundleContainerPath error:nil];
+-          for (NSString *bundleItem in bundleItems) {
+-              if ([[bundleItem pathExtension] isEqualToString:@"app"]) {
+-                  bundlePath = [bundleContainerPath stringByAppendingPathComponent:bundleItem];
+-                  break;
+-              }
+-          }
+-      }
+-      if (!bundlePath) {
+-          NSString *bundleContainerPath = [[[MCMAppContainer containerWithIdentifier:@"com.opa334.TrollStoreLite"
+-                                                                               error:nil] url] path];
+-          NSArray<NSString *> *bundleItems =
+-              [[NSFileManager defaultManager] contentsOfDirectoryAtPath:bundleContainerPath error:nil];
+-          for (NSString *bundleItem in bundleItems) {
+-              if ([[bundleItem pathExtension] isEqualToString:@"app"]) {
+-                  bundlePath = [bundleContainerPath stringByAppendingPathComponent:bundleItem];
+-                  break;
+-              }
+-          }
+-      }
+-      _binary = [bundlePath stringByAppendingPathComponent:@"trollstorehelper"];
+-    });
+-    return [_binary fileSystemRepresentation];
++static NSString *JB(NSString *path) {
++#if XAT_HAS_ROOTHIDE
++    const char *resolved = jbroot(path.fileSystemRepresentation);
++    return resolved ? [NSString stringWithUTF8String:resolved] : path;
++#else
++    return path;
++#endif
+ }
+ 
++static BOOL IsExecutable(NSString *path) {
++    if (path.length == 0) return NO;
++    return access(path.fileSystemRepresentation, X_OK) == 0;
++}
++
++static NSString *HelperInBundle(NSString *bundlePath) {
++    if (bundlePath.length == 0) return nil;
++    for (NSString *name in @[ @"trollstorehelper", @"trollstorehelper_lite" ]) {
++        NSString *candidate = [bundlePath stringByAppendingPathComponent:name];
++        if (IsExecutable(candidate)) return candidate;
++    }
++    return nil;
++}
++
++/*
++ * 第一优先：jbroot 内的确定路径。
++ * TrollStoreLite (roothide) 把 helper 放在 app 包里、且改名成了 trollstorehelper；
++ * 上游 Makefile 的 trollstorehelper_lite + /usr/local/bin 是 rootful 布局。
++ */
++static NSString *HelperByKnownPaths(void) {
++    NSArray<NSString *> *candidates = @[
++        JB(@"/Applications/TrollStoreLite.app/trollstorehelper"),
++        JB(@"/Applications/TrollStoreLite.app/trollstorehelper_lite"),
++        JB(@"/Applications/TrollStore.app/trollstorehelper"),
++        JB(@"/usr/local/bin/trollstorehelper_lite"),
++        JB(@"/usr/local/bin/trollstorehelper"),
++        @"/usr/local/bin/trollstorehelper_lite",
++        @"/usr/local/bin/trollstorehelper",
++    ];
++    for (NSString *candidate in candidates) {
++        if (IsExecutable(candidate)) return candidate;
++    }
++    return nil;
++}
++
++/* 第二优先：目录扫描，覆盖 app 被改名或装在别处的情况 */
++static NSString *HelperByBundles(void) {
++    NSArray<NSString *> *roots = @[
++        JB(@"/Applications"),
++        @"/Applications",
++        @"/var/containers/Bundle/Application",
++    ];
++    NSFileManager *fileManager = [NSFileManager defaultManager];
++    for (NSString *root in roots) {
++        NSArray<NSString *> *items = [fileManager contentsOfDirectoryAtPath:root error:nil];
++        for (NSString *item in items) {
++            if (![[item pathExtension] isEqualToString:@"app"]) continue;
++            NSString *found = HelperInBundle([root stringByAppendingPathComponent:item]);
++            if (found) return found;
++        }
++    }
++    return nil;
++}
++
++/* 第三优先：旧逻辑，LaunchServices / MobileContainerManager 兜底 */
++static NSString *HelperByLegacyLookup(void) {
++    NSArray<NSString *> *identifiers = @[ @"com.opa334.TrollStoreLite", @"com.opa334.TrollStore" ];
++
++    for (NSString *identifier in identifiers) {
++        LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:identifier];
++        NSString *found = HelperInBundle([appProxy.bundleURL path]);
++        if (found) return found;
++    }
++
++    for (NSString *identifier in identifiers) {
++        NSString *bundleContainerPath =
++            [[[MCMAppContainer containerWithIdentifier:identifier error:nil] url] path];
++        NSArray<NSString *> *items =
++            [[NSFileManager defaultManager] contentsOfDirectoryAtPath:bundleContainerPath error:nil];
++        for (NSString *item in items) {
++            if (![[item pathExtension] isEqualToString:@"app"]) continue;
++            NSString *found = HelperInBundle([bundleContainerPath stringByAppendingPathComponent:item]);
++            if (found) return found;
++        }
++    }
++
++    return nil;
++}
++
++static NSString *ResolvedHelperPath(void) {
++    static NSString *cached = nil;
++
++    if (cached && IsExecutable(cached)) return cached;
++
++    NSString *found = HelperByKnownPaths();
++    if (!found) found = HelperByBundles();
++    if (!found) found = HelperByLegacyLookup();
++
++    if (found) {
++        cached = found;
++        HBLogInfo(@TAG "resolved trollstore helper: %@", found);
++    } else {
++        cached = nil;
++        HBLogError(@TAG "unable to locate trollstore helper in any known location");
++    }
++    return found;
++}
++
++static NSString *TailOfFile(NSString *path, NSUInteger maxLength) {
++    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
++    if (!text) return @"";
++    if (text.length <= maxLength) return text;
++    return [text substringFromIndex:text.length - maxLength];
++}
++
++/*
++ * 跑 helper，并把它的 stdout/stderr 落到临时文件再回读。
++ * 原来的实现用 posix_spawn(..., NULL) 且不重定向，失败时什么线索都留不下。
++ * 返回 helper 的退出码；负值表示启动/等待失败。
++ */
++static int RunHelper(NSString *helperPath, NSArray<NSString *> *arguments, NSString **outputTail) {
++    NSString *logPath = [NSTemporaryDirectory()
++        stringByAppendingPathComponent:[NSString stringWithFormat:@"trollinstalld-%@.log", [NSUUID UUID].UUIDString]];
++    [[NSFileManager defaultManager] createFileAtPath:logPath contents:[NSData data] attributes:nil];
++
++    posix_spawn_file_actions_t fileActions;
++    posix_spawn_file_actions_init(&fileActions);
++    posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, logPath.fileSystemRepresentation,
++                                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, logPath.fileSystemRepresentation,
++                                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
++
++    NSMutableArray<NSString *> *fullArguments = [NSMutableArray arrayWithObject:helperPath];
++    [fullArguments addObjectsFromArray:arguments];
++
++    char **argv = (char **)calloc(fullArguments.count + 1, sizeof(char *));
++    for (NSUInteger idx = 0; idx < fullArguments.count; idx++) {
++        argv[idx] = strdup(fullArguments[idx].fileSystemRepresentation);
++    }
++    argv[fullArguments.count] = NULL;
++
++    /* helper 需要 PATH 才能找到 jbroot 里的 ldid 等工具 */
++    extern char **environ;
++    pid_t pid = 0;
++    int spawnStatus = posix_spawn(&pid, helperPath.fileSystemRepresentation, &fileActions, NULL, argv, environ);
++    posix_spawn_file_actions_destroy(&fileActions);
++
++    for (NSUInteger idx = 0; idx < fullArguments.count; idx++) {
++        free(argv[idx]);
++    }
++    free(argv);
++
++    int result = -1;
++    if (spawnStatus != 0) {
++        HBLogError(@TAG "posix_spawn failed for %@: %s", helperPath, strerror(spawnStatus));
++        result = -spawnStatus;
++    } else {
++        int status = 0;
++        pid_t waited = -1;
++        while ((waited = waitpid(pid, &status, 0)) < 0) {
++            if (errno == EINTR) continue;
++            HBLogError(@TAG "waitpid failed: %s", strerror(errno));
++            break;
++        }
++        if (waited > 0) {
++            result = WIFEXITED(status) ? WEXITSTATUS(status) : -(WTERMSIG(status));
++        }
++    }
++
++    NSString *tail = TailOfFile(logPath, 3000);
++    if (outputTail) *outputTail = tail;
++    HBLogInfo(@TAG "helper %@ exited with %d", helperPath.lastPathComponent, result);
++
++    if (tail.length > 0) {
++        HBLogInfo(@TAG "helper output:\n%@", tail);
++    }
++    [[NSFileManager defaultManager] removeItemAtPath:logPath error:nil];
++
++    return result;
++}
++
+ @interface TrollInstallerService : NSObject
+ - (void)onOneWayMessage:(NSString *)message userInfo:(NSDictionary *)userInfo;
+ - (NSDictionary *)onTwoWayMessage:(NSString *)message userInfo:(NSDictionary *)userInfo;
+ - (NSDictionary *)onRemoteInstallPackage:(NSString *)message userInfo:(NSDictionary *)userInfo;
++- (NSDictionary *)onDescribeEnvironment:(NSString *)message userInfo:(NSDictionary *)userInfo;
+ @end
+ 
+ @implementation TrollInstallerService
+@@ -73,71 +228,52 @@
+     };
+ }
+ 
++/* 排障用：一行 XPC 就能看到 helper 解析结果，不用重装包 */
++- (NSDictionary *)onDescribeEnvironment:(NSString *)message userInfo:(NSDictionary *)userInfo {
++    NSString *helper = ResolvedHelperPath();
++    NSString *ldid = JB(@"/usr/bin/ldid");
++    return @{
++        @"HelperPath" : helper ?: @"(none)",
++        @"LdidPath" : ldid,
++        @"LdidExists" : @(IsExecutable(ldid)),
++        @"Uid" : @(getuid()),
++    };
++}
++
+ - (NSDictionary *)onRemoteInstallPackage:(NSString *)message userInfo:(NSDictionary *)userInfo {
+     NSString *packagePath = userInfo[@"PackagePath"];
+-    HBLogDebug(@"Received remote install request for package at path: %@", packagePath);
++    HBLogInfo(@TAG "received install request for package: %@", packagePath);
+ 
+-    if (!packagePath || ![[NSFileManager defaultManager] fileExistsAtPath:packagePath]) {
+-        HBLogError(@"Invalid package path: %@", packagePath);
++    if (packagePath.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:packagePath]) {
++        HBLogError(@TAG "invalid package path: %@", packagePath);
+         return @{@"error" : @"Invalid package path."};
+     }
+ 
+-    HBLogDebug(@"Installing package at path: %@", packagePath);
+-
+-    // trollstorehelper install <package_path>
+-    const char *trollHelper = installer_binary();
+-    HBLogDebug(@TAG "Using TrollStore helper at path: %s", trollHelper);
+-
+-    if (access(trollHelper, F_OK) != 0) {
+-        HBLogDebug(@TAG "TrollStore helper binary not found!");
++    NSString *helperPath = ResolvedHelperPath();
++    if (!helperPath) {
+         return @{@"error" : @"TrollStore helper binary not found"};
+     }
+ 
+-    // Prepare arguments for posix_spawn
+-    const char *args[] = {trollHelper, "install", "force", [packagePath UTF8String], NULL};
+-    pid_t pid;
+-    int status;
++    /* 与上游 RootHelper/main.m 的 install 子命令语法一致：install [force] <ipa> */
++    NSString *outputTail = nil;
++    int exitStatus = RunHelper(helperPath, @[ @"install", @"force", packagePath ], &outputTail);
+ 
+-    // Execute trollstorehelper
+-    HBLogDebug(@TAG "Executing: %s install %@", trollHelper, packagePath);
+-    status = posix_spawn(&pid, trollHelper, NULL, NULL, (char *const *)args, NULL);
+-
+-    if (status != 0) {
+-        HBLogDebug(@TAG "Failed to execute trollstorehelper: %s", strerror(status));
+-        return @{@"error" : [NSString stringWithFormat:@"Failed to execute process: %s", strerror(status)]};
++    if (exitStatus != 0) {
++        HBLogError(@TAG "installation failed with exit code %d", exitStatus);
++        /* 失败时保留 ipa，便于从 /tmp 取出复现 */
++        return @{
++            @"error" : [NSString stringWithFormat:@"Installation failed with exit code: %d", exitStatus],
++            @"OutputTail" : outputTail ?: @"",
++        };
+     }
+ 
+-    HBLogDebug(@TAG "Successfully spawned trollstorehelper with pid: %d", pid);
+-
+-    // Wait for the process to finish
+-    int waitResult;
+-    while ((waitResult = waitpid(pid, &status, 0)) < 0) {
+-        if (errno == EINTR) {
+-            // Interrupted by signal, retry
+-            continue;
+-        }
+-        HBLogDebug(@TAG "Error waiting for trollstorehelper: %s", strerror(errno));
+-        return @{@"error" : [NSString stringWithFormat:@"Error waiting for process: %s", strerror(errno)]};
+-    }
+-
+-    // Clean up the package file after installation
+     [[NSFileManager defaultManager] removeItemAtPath:packagePath error:nil];
+ 
+-    if (!WIFEXITED(status)) {
+-        HBLogDebug(@TAG "trollstorehelper did not exit normally");
+-        return @{@"error" : @"Process did not exit normally"};
+-    }
+-
+-    int exitStatus = WEXITSTATUS(status);
+-    HBLogDebug(@TAG "trollstorehelper exited with status: %d", exitStatus);
+-
+-    if (exitStatus != 0) {
+-        return @{@"error" : [NSString stringWithFormat:@"Installation failed with exit code: %d", exitStatus]};
+-    }
+-
+-    // It's ok that we don't return the installed app info here,
+-    // as the client actually doesn't care about it.
+-    return @{@"InstalledAppInfoArray" : @[@{}]};
++    /*
++     * 客户端只关心成功与否，不读这里的 app 信息，
++     * 真实安装结果由 installd 那侧的 LSApplicationProxy 重新构造。
++     */
++    return @{@"InstalledAppInfoArray" : @[ @{} ]};
+ }
+ 
+ @end
+@@ -145,6 +281,10 @@
+ int main(int argc, const char *argv[]) {
+ 
+     @autoreleasepool {
++        HBLogInfo(@TAG "daemon starting, roothide=%d", XAT_HAS_ROOTHIDE);
++        HBLogInfo(@TAG "jbroot = %@", JB(@"/"));
++        HBLogInfo(@TAG "helper = %@", ResolvedHelperPath() ?: @"(none)");
++
+         static TrollInstallerService *server;
+         server = [[TrollInstallerService alloc] init];
+ 
+@@ -158,6 +298,10 @@
+         [messagingCenter registerForMessageName:@"TwoWayMessage"
+                                          target:server
+                                        selector:@selector(onTwoWayMessage:userInfo:)];
++
++        [messagingCenter registerForMessageName:@"DescribeEnvironment"
++                                         target:server
++                                       selector:@selector(onDescribeEnvironment:userInfo:)];
+ 
+         [messagingCenter registerForMessageName:@"InstallPackage"
+                                          target:server
